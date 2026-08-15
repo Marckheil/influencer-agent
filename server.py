@@ -224,7 +224,7 @@ MOTION_PROMPT = ("slow cinematic push-in, gentle handheld motion, "
 #   video_url=<public mp4> ; user=<connected profile> ; title=<caption>
 def uploadpost_publish(video_url, caption, first_comment=None):
     form = {
-        "video_url": video_url,
+        "video": video_url,
         "user": UPLOADPOST_USER,
         "title": caption,
         "platform[]": "instagram",
