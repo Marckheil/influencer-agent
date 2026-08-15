@@ -24,7 +24,7 @@
 #   POST /idea      -> queue a specific content idea  {"idea": "..."}
 #   GET  /          -> tiny status page
 
-import os, re, json, time, pathlib, urllib.request, urllib.error
+import os, re, json, time, pathlib, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -96,7 +96,6 @@ def http_json(method, url, headers=None, body=None, form=None, timeout=120):
     data = None
     if form is not None:
         # multipart-ish: Upload-Post accepts application/x-www-form-urlencoded too
-        import urllib.parse
         data = urllib.parse.urlencode(form, doseq=True).encode()
         headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
     elif body is not None:
