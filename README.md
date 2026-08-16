@@ -97,9 +97,4 @@ Start with the heartbeat; it doubles as the scheduler.
 5. Set up the heartbeat cron to hit `/run`.
 6. Queue a first idea and watch the approval email arrive.
 
-## Compliance note (say this to Maria)
 
-This uses Instagram's **official** Content Publishing API via Upload-Post — the
-same pipeline Buffer/Hootsuite use — NOT browser automation or login bots, which
-violate IG's ToS and get accounts banned. The human-approval step keeps a person
-in the loop on everything published.
