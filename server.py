@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 # Reelayer — MULTI-TENANT agentic influencer on Maritime.
 #
 # One agent, many users. Each user (keyed by email) has their own niche,
@@ -9,15 +9,7 @@
 #        -> posting -> idle
 #   The user gets emailed each video; they reply "post" or "skip".
 #   Frequency + timezone decide WHEN a new video starts for each user.
-#
-# WHY this shape fits Maritime: bursty scheduled work. An external cron
-# pokes /run; the agent wakes, advances every user that has work, sleeps.
-#
-# STAGE 1 SCOPE (this file): signup, per-user generation, per-user approval
-# email, and posting *if* the user has an Instagram profile connected.
-# Per-user Instagram OAuth connection (Upload-Post profile API) is stubbed
-# here and wired in Stage 2 — users without a connected profile still get
-# their video by email, they just can't auto-post yet.
+
 
 import os, re, json, time, pathlib, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -190,6 +182,46 @@ def higgsfield_poll_video(rid):
 
 
 # ---------------- Upload-Post ----------------
+UPLOADPOST_BASE = "https://api.upload-post.com/api/uploadposts"
+
+def _up_headers():
+    return {"Authorization": f"Apikey {UPLOADPOST_API_KEY}"}
+
+def uploadpost_profile_name(email):
+    """A safe Upload-Post username derived from the user's email (their profile id)."""
+    return "reelayer_" + re.sub(r"[^a-zA-Z0-9]", "_", email.lower())
+
+def uploadpost_create_profile(email):
+    """Create the user's Upload-Post profile. Idempotent (409 = already exists = fine)."""
+    uname = uploadpost_profile_name(email)
+    status, data = http_json("POST", f"{UPLOADPOST_BASE}/users",
+                             headers=_up_headers(), body={"username": uname})
+    if status in (200, 201, 409):
+        return uname
+    raise RuntimeError(f"create_profile failed: {status} {data}")
+
+def uploadpost_connect_link(email, redirect_url=None):
+    """Generate the 1-hour connect URL the user visits to link their Instagram."""
+    uname = uploadpost_profile_name(email)
+    body = {"username": uname, "platforms": ["instagram"]}
+    if redirect_url:
+        body["redirect_url"] = redirect_url
+    status, data = http_json("POST", f"{UPLOADPOST_BASE}/users/generate-jwt",
+                             headers=_up_headers(), body=body)
+    if status == 200 and isinstance(data, dict) and data.get("access_url"):
+        return data["access_url"]
+    raise RuntimeError(f"connect_link failed: {status} {data}")
+
+def uploadpost_is_connected(email):
+    """True if this user's profile has Instagram connected."""
+    uname = uploadpost_profile_name(email)
+    status, data = http_json("GET", f"{UPLOADPOST_BASE}/users/{uname}", headers=_up_headers())
+    if status == 200 and isinstance(data, dict):
+        ig = (data.get("profile") or {}).get("social_accounts", {}).get("instagram")
+        return bool(ig)
+    return False
+
+
 def uploadpost_publish(video_url, caption, uploadpost_user):
     form = {
         "video": video_url,
@@ -283,11 +315,22 @@ def advance_user(email, user, now):
 
     elif user["stage"] == "posting":
         try:
+            # Check live connection status with Upload-Post (don't trust stale flag).
             if not user.get("uploadpost_user"):
-                # No IG connected yet — hold the video, tell them once, go idle.
-                inkbox_send(email, "Connect Instagram to publish",
-                    "Your video is ready, but your Instagram isn't connected yet, so I "
-                    "can't publish it. Once you connect, future videos post automatically.")
+                if uploadpost_is_connected(email):
+                    user["uploadpost_user"] = uploadpost_profile_name(email)
+
+            if not user.get("uploadpost_user"):
+                # Still not connected — hold the video, send a fresh connect link, go idle.
+                try:
+                    link = uploadpost_connect_link(email)
+                except Exception:
+                    link = None
+                msg = ("Your video is ready, but your Instagram isn't connected yet, so I "
+                       "can't publish it.")
+                if link:
+                    msg += f"\n\nConnect here (1 hour):\n{link}\n\nThen future videos auto-post."
+                inkbox_send(email, "Connect Instagram to publish", msg)
                 user["history"].append({"idea": user["idea"], "video_url": user["video_url"],
                                         "posted_at": None, "reason": "no_ig"})
                 user["stage"] = "idle"
@@ -329,6 +372,16 @@ def run_cycle():
             # frequency change by reply
             if decision.startswith("once"): u["frequency"] = 1
             elif decision.startswith("twice"): u["frequency"] = 2
+            # fresh connect link on request
+            if decision.startswith("connect"):
+                try:
+                    uploadpost_create_profile(sender)
+                    link = uploadpost_connect_link(sender)
+                    inkbox_send(sender, "Connect your Instagram",
+                        f"Here's a fresh link (valid 1 hour):\n{link}")
+                    summary["reply"] = f"{sender}:connect"
+                except Exception as e:
+                    u["last_error"] = f"connect: {str(e)[:150]}"
             save_users(users)
 
     # 2) advance every user one step (due idles start; in-flight ones progress)
@@ -351,14 +404,29 @@ def register_user(email, instagram, niche, frequency, tz_offset):
     users[email] = new_user(email, (instagram or "").strip().lstrip("@"),
                             (niche or DEFAULT_NICHE).strip(), frequency or 1, tz_offset or 0)
     save_users(users)
-    # welcome + kick off first video immediately on the next /run
+
+    # Stage 2: create their Upload-Post profile + generate a connect link, email it.
+    connect_url = None
     try:
-        inkbox_send(email, "Your Reelayer agent is live 🎬",
-            f"Welcome! Your agent will start making {users[email]['niche']} videos and email "
-            f"each one here for you to approve. First one is generating now.")
+        uploadpost_create_profile(email)
+        connect_url = uploadpost_connect_link(email)
+    except Exception as e:
+        # profile/link failure shouldn't block signup — they still get videos by email
+        users[email]["last_error"] = f"connect setup: {str(e)[:150]}"
+        save_users(users)
+
+    # welcome + connect instructions
+    try:
+        body = (f"Welcome! Your agent will start making {users[email]['niche']} videos and "
+                f"email each one here for you to approve.\n\n")
+        if connect_url:
+            body += ("One thing first — connect your Instagram so it can publish for you:\n"
+                     f"{connect_url}\n\n(link is valid for 1 hour; reply CONNECT for a fresh one)\n\n")
+        body += "First video is generating now."
+        inkbox_send(email, "Your Reelayer agent is live 🎬", body)
     except Exception:
         pass
-    return 200, {"ok": True, "email": email}
+    return 200, {"ok": True, "email": email, "connect_url": connect_url}
 
 
 # ---------------- HTTP ----------------
@@ -385,6 +453,19 @@ class Handler(BaseHTTPRequestHandler):
                 code, resp = register_user(d.get("email"), d.get("instagram"),
                                            d.get("niche"), d.get("frequency"), d.get("tz_offset"))
                 self._json(code, resp)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": str(e)[:300]})
+        elif self.path.startswith("/connect"):
+            # Frontend "Connect Instagram" button: returns a fresh connect URL.
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                d = json.loads(self.rfile.read(n) or b"{}")
+                email = (d.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    return self._json(400, {"ok": False, "error": "email required"})
+                uploadpost_create_profile(email)
+                url = uploadpost_connect_link(email)
+                self._json(200, {"ok": True, "connect_url": url})
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)[:300]})
         else:
